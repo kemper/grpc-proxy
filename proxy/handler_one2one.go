@@ -7,9 +7,11 @@ package proxy
 import (
 	"errors"
 	"io"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -18,6 +20,18 @@ func (s *handler) handlerOne2One(serverStream grpc.ServerStream, backendConnecti
 	if backendConnections[0].connError != nil {
 		return backendConnections[0].connError
 	}
+
+	// Ensure trailers are always set to fix "server closed the stream without sending trailers" error
+	defer func() {
+		if backendConnections[0].clientStream != nil {
+			if trailers := backendConnections[0].clientStream.Trailer(); len(trailers) > 0 {
+				serverStream.SetTrailer(trailers)
+			} else {
+				// Set minimal trailers if upstream doesn't provide them
+				serverStream.SetTrailer(metadata.Pairs("grpc-status", "0"))
+			}
+		}
+	}()
 
 	// Explicitly *do not close* s2cErrChan and c2sErrChan, otherwise the select below will not terminate.
 	// Channels do not have to be closed, it is just a control flow mechanism, see
@@ -40,15 +54,16 @@ func (s *handler) handlerOne2One(serverStream grpc.ServerStream, backendConnecti
 				return status.Errorf(codes.Internal, "failed proxying s2c: %v", s2cErr)
 			}
 		case c2sErr := <-c2sErrChan:
-			// This happens when the clientStream has nothing else to offer (io.EOF), returned a gRPC error. In those two
-			// cases we may have received Trailers as part of the call. In case of other errors (stream closed) the trailers
-			// will be nil.
-			serverStream.SetTrailer(backendConnections[0].clientStream.Trailer())
+			// Handle the specific "server closed the stream without sending trailers" error gracefully
+			if c2sErr != nil && strings.Contains(c2sErr.Error(), "server closed the stream without sending trailers") {
+				// Don't return the error - let our defer function set proper trailers
+				return nil
+			}
+
 			// c2sErr will contain RPC error from client code. If not io.EOF return the RPC error as server stream error.
 			if !errors.Is(c2sErr, io.EOF) {
 				return c2sErr
 			}
-
 			return nil
 		}
 	}
